@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/joho/godotenv"
 )
 
 type Config struct {
@@ -14,7 +16,7 @@ type Config struct {
 	CurrentUserName string `json:"current_user_name"`
 }
 
-const configFileName = "gatorconfig.json"
+const configFileName = ".gatorconfig.json"
 
 func getConfigFilePath() (string, error) {
 	if configFileName == "" {
@@ -46,6 +48,7 @@ func (cfg *Config) write() error {
 
 func Read() (*Config, error) {
 	var cfg Config
+	_ = godotenv.Load()
 	configPath, err := getConfigFilePath()
 	if err != nil {
 		return nil, err
@@ -56,8 +59,12 @@ func Read() (*Config, error) {
 			return nil, err
 		}
 		// Create a default config if file doesn't exist
+		dbURL, ok := os.LookupEnv("psql_conn_string")
+		if !ok {
+			return nil, fmt.Errorf("'psql_conn_string' environment variable is not set and no config file found at %v", configPath)
+		}
 		defaultCfg := Config{
-			DB_URL:          "",
+			DB_URL:          dbURL,
 			CurrentUserName: "",
 		}
 		cfg = defaultCfg
@@ -71,10 +78,9 @@ func Read() (*Config, error) {
 	return &cfg, nil
 }
 
-func SetUsername(username string) error {
-	cfg, err := Read()
-	if err != nil {
-		return fmt.Errorf("Error reading config: %w", err)
+func (cfg *Config) SetUsername(username string) error {
+	if username == "" {
+		return fmt.Errorf("username not provided")
 	}
 	cfg.CurrentUserName = username
 	if err := cfg.write(); err != nil {

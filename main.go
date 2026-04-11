@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -48,6 +49,7 @@ func main() {
 	cmds.register("follow", middlewareLoggedIn(handlerFollowFeed))
 	cmds.register("following", middlewareLoggedIn(handlerFollowingFeeds))
 	cmds.register("unfollow", middlewareLoggedIn(handlerUnfollowFeed))
+	cmds.register("browse", handlerBrowse)
 	//endregion
 	cmd := command{
 		Name: os.Args[1],
@@ -228,29 +230,6 @@ func fetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {
 	return &feed, nil
 }
 
-func handlerAgg(s *state, cmd command) error {
-	/*
-		if len(cmd.Args) != 1 {
-			return fmt.Errorf("Incorrect usage of agg command. Usage: agg <feed_url>")
-		}
-		feedURL := cmd.Args[0]
-	*/
-	feedURL := "https://www.wagslane.dev/index.xml"
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	feed, err := fetchFeed(ctx, feedURL)
-	if err != nil {
-		return fmt.Errorf("Error fetching feed: %w", err)
-	}
-	fmt.Printf("Feed Title: %s\n", feed.Channel.Title)
-	fmt.Printf("Feed Description: %s\n", feed.Channel.Description)
-	fmt.Println("Items:")
-	for _, item := range feed.Channel.Item {
-		fmt.Printf("- %s (%s)\n  %s\n  Published on: %s\n", item.Title, item.Link, item.Description, item.PubDate)
-	}
-	return nil
-}
-
 func handlerAddFeed(s *state, cmd command, user database.User) error {
 	if user.Name == "" {
 		return fmt.Errorf("No user logged in. Please login first.")
@@ -378,4 +357,134 @@ func handlerUnfollowFeed(s *state, cmd command, user database.User) error {
 	}
 	fmt.Printf("%s has unfollowed '%s'!\n", user.Name, feed.Name)
 	return nil
+}
+
+func scrapeFeeds(s *state) error {
+	feed, err := s.db.GetNextFeedToFetch(context.Background())
+	if err != nil {
+		return fmt.Errorf("Error fetching next feed to scrape: %w", err)
+	}
+	data, err := fetchFeed(context.Background(), feed.Url)
+	if err != nil {
+		return fmt.Errorf("Error fetching feed data: %w", err)
+	}
+	fmt.Printf("Fetched feed '%s' with %d items\n", feed.Name, len(data.Channel.Item))
+	_, err = s.db.MarkFeedFetched(context.Background(), feed.ID)
+	if err != nil {
+		return fmt.Errorf("Error marking feed as fetched: %w", err)
+	}
+	preExistingPostCount := 0
+	totalPostCount := 0
+	for i, item := range data.Channel.Item {
+		postParam, preExisting := prepPost(s, item, feed)
+		if preExisting {
+			preExistingPostCount++
+			continue
+		}
+		totalPostCount++
+		_, err := s.db.CreatePost(context.Background(), postParam)
+		if err != nil {
+			fmt.Printf("Error creating post: %v\n", err)
+		}
+		fmt.Printf("Processed post %d: %s\n", i+1, item.Title)
+	}
+	fmt.Printf("Finished scraping feed '%s'. Total new posts: %d, pre-existing posts: %d\n", feed.Name, totalPostCount, preExistingPostCount)
+	return nil
+}
+
+func prepPost(s *state, item RSSItem, feed database.Feed) (postParams database.CreatePostParams, preExisting bool) {
+	existingPost, _ := s.db.GetPost(context.Background(), item.Link)
+	if item.Link == existingPost.Url {
+		postParams = database.CreatePostParams{
+			Title:       existingPost.Title,
+			Url:         existingPost.Url,
+			Description: existingPost.Description,
+			PublishedAt: existingPost.PublishedAt,
+			FeedID:      existingPost.FeedID,
+		}
+		return postParams, true
+	}
+	title := sql.NullString{
+		String: item.Title,
+		Valid:  item.Title != "",
+	}
+	description := sql.NullString{
+		String: item.Description,
+		Valid:  item.Description != "",
+	}
+	publishAt_t, _ := time.Parse(time.RFC1123Z, item.PubDate)
+	publishAt := sql.NullTime{
+		Time:  publishAt_t,
+		Valid: publishAt_t != time.Time{},
+	}
+	postParams = database.CreatePostParams{
+		Title:       title,
+		Url:         item.Link,
+		Description: description,
+		PublishedAt: publishAt,
+		FeedID:      feed.ID,
+	}
+	return postParams, false
+}
+
+func handlerAgg(s *state, cmd command) error {
+	var time_between_reqs string
+	if cmd.Args[0] != "" {
+		time_between_reqs = cmd.Args[0]
+	}
+	timer, err := time.ParseDuration(time_between_reqs)
+	minimumTimer := 5 * time.Second
+	if timer <= minimumTimer {
+		fmt.Printf("Duration too short: %v. Setting to minimum is %v.\n", timer, minimumTimer)
+		timer = minimumTimer
+	}
+	if err != nil {
+		fmt.Printf("Invalid duration format: %v\n", err)
+		return fmt.Errorf("Invalid duration format: %w", err)
+	}
+	ticker := time.NewTicker(timer)
+	defer ticker.Stop()
+
+	for ; ; <-ticker.C {
+		if err := scrapeFeeds(s); err != nil {
+			fmt.Printf("Error scraping feeds: %v\n", err)
+		}
+	}
+}
+
+func handlerBrowse(s *state, cmd command) error {
+	limit := "2"
+	if len(cmd.Args) == 1 {
+		limit = cmd.Args[0]
+	}
+	limitInt, err := strconv.ParseInt(limit, 10, 32)
+	if err != nil {
+		return fmt.Errorf("Invalid limit format: %w", err)
+	}
+	user, err := s.db.GetUser(context.Background(), s.config.CurrentUserName)
+	if err != nil {
+		return fmt.Errorf("Error fetching user: %w", err)
+	}
+
+	posts, err := s.db.GetUsersFeedPosts(context.Background(), database.GetUsersFeedPostsParams{
+		UserID: user.ID,
+		Limit:  int32(limitInt),
+	})
+	if err != nil {
+		return fmt.Errorf("Error fetching posts: %w", err)
+	}
+	if len(posts) == 0 {
+		fmt.Println("No posts found in your feed. Try following some feeds first!")
+		return nil
+	}
+	for _, post := range posts {
+		fmt.Printf("Title: %s\n", post.Title.String)
+		fmt.Printf("Description: %s\n", post.Description.String)
+		fmt.Printf("URL: %s\n", post.Url)
+		fmt.Printf("Published At: %v\n", post.PublishedAt.Time)
+		fmt.Printf("Feed ID: %v\n", post.FeedID)
+		fmt.Println("-----")
+	}
+	return nil
+
 }
